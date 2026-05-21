@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.vite/
+coverage/
+data/*.json
+!data/.gitkeep
+*.log
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
