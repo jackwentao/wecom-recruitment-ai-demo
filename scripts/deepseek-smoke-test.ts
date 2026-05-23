@@ -223,6 +223,7 @@ async function main() {
         offerCandidates: 0,
         gap: 1,
         stageCounts: emptyStageCounts(),
+        candidates: [candidate],
         keyCandidates: [
           {
             candidate,

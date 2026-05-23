@@ -18,6 +18,8 @@ import type {
 } from "../../shared/types";
 import { effectiveStages } from "../../shared/types";
 
+type InterviewRound = "一面" | "二面" | "三面" | "四面" | "终面" | "复试";
+
 const emptyData = (): AppData => ({
   messages: [],
   candidates: [],
@@ -104,6 +106,7 @@ export class CandidateRepository {
     let candidate: Candidate;
     let created = false;
     if (existing) {
+      const interviewTime = this.resolveInterviewTime(existing, extraction, message.content);
       candidate = {
         ...existing,
         name: this.normalizeCandidateName(existing.name) || existing.name,
@@ -112,7 +115,7 @@ export class CandidateRepository {
         stage: extraction.stage,
         owner: extraction.owner ?? existing.owner,
         sourceGroup: extraction.sourceGroup ?? message.groupName ?? existing.sourceGroup,
-        interviewTime: extraction.interviewTime ?? existing.interviewTime,
+        interviewTime,
         summary: extraction.summary,
         risks: extraction.risks,
         nextAction: extraction.nextAction,
@@ -363,6 +366,7 @@ export class CandidateRepository {
       offerCandidates: stageCounts.offer,
       gap,
       stageCounts,
+      candidates,
       keyCandidates,
       riskCandidates,
       summary
@@ -656,6 +660,7 @@ export class CandidateRepository {
         : duplicate.jobId || !this.isUnconfirmedPosition(duplicate.position)
           ? duplicate
           : target;
+    const secondary = primary.id === target.id ? duplicate : target;
     return {
       ...target,
       phone: target.phone ?? duplicate.phone,
@@ -664,7 +669,7 @@ export class CandidateRepository {
       stage: primary.stage,
       owner: primary.owner ?? target.owner ?? duplicate.owner,
       sourceGroup: target.sourceGroup ?? duplicate.sourceGroup,
-      interviewTime: primary.interviewTime ?? target.interviewTime ?? duplicate.interviewTime,
+      interviewTime: this.resolveMergedInterviewTime(primary, secondary, target, duplicate),
       summary: this.mergeSummary(primary.summary, primary.id === target.id ? duplicate.summary : target.summary),
       risks: Array.from(new Set([...target.risks, ...duplicate.risks])),
       nextAction: primary.nextAction || target.nextAction || duplicate.nextAction,
@@ -718,6 +723,84 @@ export class CandidateRepository {
       .trim()
       .replace(/(?:一面|二面|三面|四面|终面|初面|复试|面试|面评|反馈|通过|不通过|淘汰|候选人|简历).*$/u, "")
       .replace(/[^\u4e00-\u9fa5A-Za-z]/g, "");
+  }
+
+  private resolveInterviewTime(
+    existing: Candidate,
+    extraction: ExtractedRecruitmentInfo,
+    messageContent: string
+  ): string | undefined {
+    if (extraction.interviewTime) return extraction.interviewTime;
+    if (this.hasInterviewRoundChanged(existing, extraction, messageContent)) return undefined;
+    return existing.interviewTime;
+  }
+
+  private resolveMergedInterviewTime(
+    primary: Candidate,
+    secondary: Candidate,
+    target: Candidate,
+    duplicate: Candidate
+  ): string | undefined {
+    if (primary.interviewTime) return primary.interviewTime;
+    if (this.hasCandidateRoundChanged(secondary, primary)) return undefined;
+    return target.interviewTime ?? duplicate.interviewTime;
+  }
+
+  private hasInterviewRoundChanged(
+    existing: Candidate,
+    extraction: ExtractedRecruitmentInfo,
+    messageContent: string
+  ): boolean {
+    const existingRound = this.extractCandidateInterviewRound(existing);
+    if (!existingRound) return false;
+    const incomingText = [messageContent, extraction.summary, extraction.nextAction].join("；");
+    const incomingRound = this.extractTargetInterviewRound(incomingText);
+    if (incomingRound) return incomingRound !== existingRound;
+    return this.mentionsNextInterviewRound(incomingText);
+  }
+
+  private hasCandidateRoundChanged(previous: Candidate, current: Candidate): boolean {
+    const previousRound = this.extractCandidateInterviewRound(previous);
+    if (!previousRound) return false;
+    const currentRound = this.extractCandidateInterviewRound(current);
+    return Boolean(currentRound && currentRound !== previousRound);
+  }
+
+  private extractCandidateInterviewRound(candidate: Candidate): InterviewRound | undefined {
+    return this.extractTargetInterviewRound(
+      [
+        candidate.nextAction,
+        candidate.summary,
+        ...candidate.timeline.slice(0, 3).flatMap((item) => [item.summary, item.content])
+      ].join("；")
+    );
+  }
+
+  private extractTargetInterviewRound(text: string): InterviewRound | undefined {
+    const roundText = "(初面|一面|二面|三面|四面|终面|复试)";
+    const actionBeforeRound = new RegExp(
+      `(?:安排|约|预约|定|确认|更新|改到|改为|调整|推进|进入|转入|准备|邀约|约定|约了|约面|面试时间).{0,12}?${roundText}`,
+      "u"
+    );
+    const roundBeforeAction = new RegExp(
+      `${roundText}.{0,12}?(?:安排|约|预约|时间|日程|改到|改为|调整|更新|确认|跟进|负责人|面试官|反馈|结果)`,
+      "u"
+    );
+    const actionMatch = text.match(actionBeforeRound) ?? text.match(roundBeforeAction);
+    if (actionMatch?.[1]) return this.normalizeInterviewRound(actionMatch[1]);
+    const allRounds = [...text.matchAll(new RegExp(roundText, "gu"))];
+    const lastRound = allRounds.at(-1)?.[1];
+    return lastRound ? this.normalizeInterviewRound(lastRound) : undefined;
+  }
+
+  private normalizeInterviewRound(round: string): InterviewRound {
+    return round === "初面" ? "一面" : (round as InterviewRound);
+  }
+
+  private mentionsNextInterviewRound(text: string): boolean {
+    return /(?:安排|约|预约|推进|进入|转入|准备|邀约).{0,8}(?:下一轮|下轮|后续面试|复试)|(?:下一轮|下轮|后续面试).{0,8}(?:安排|时间|跟进|负责人)/u.test(
+      text
+    );
   }
 
   private isUnconfirmedPosition(position: string | undefined): boolean {

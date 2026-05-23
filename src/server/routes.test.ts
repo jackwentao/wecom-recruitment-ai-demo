@@ -1,9 +1,11 @@
 import express from "express";
+import ExcelJS from "exceljs";
 import { mkdtemp, rm } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { Candidate } from "../shared/types";
 import { RuleBasedFallbackExtractor } from "./ai/AiExtractor";
 import { PlainTextDocumentExtractor } from "./documents/PdfTextExtractor";
 import { CandidateRepository } from "./repositories/CandidateRepository";
@@ -14,6 +16,31 @@ import { WeComCrypto } from "./wecom/WeComCrypto";
 
 let tempDir = "";
 let server: http.Server | undefined;
+const now = "2026-05-22T07:00:00.000Z";
+
+function buildRouteCandidate(patch: Partial<Candidate>): Candidate {
+  return {
+    id: patch.id ?? "candidate-id",
+    name: patch.name ?? "张三",
+    phone: patch.phone,
+    jobId: patch.jobId,
+    position: patch.position ?? "Java后端",
+    stage: patch.stage ?? "screening",
+    owner: patch.owner,
+    sourceGroup: patch.sourceGroup,
+    interviewTime: patch.interviewTime,
+    summary: patch.summary ?? "候选人摘要",
+    risks: patch.risks ?? [],
+    nextAction: patch.nextAction ?? "继续跟进",
+    confidence: patch.confidence ?? 0.8,
+    resumeProfile: patch.resumeProfile,
+    matchScore: patch.matchScore,
+    evaluation: patch.evaluation,
+    createdAt: patch.createdAt ?? now,
+    updatedAt: patch.updatedAt ?? now,
+    timeline: patch.timeline ?? []
+  };
+}
 
 afterEach(async () => {
   if (server) {
@@ -166,13 +193,34 @@ describe("API routes", () => {
       })
     });
     const jobs = await fetch(`${baseUrl}/api/jobs`).then((res) => res.json());
+    const candidateNames = ["张三", "李四", "王五", "赵六", "钱七", "孙八"];
+    const data = await repository.all();
+    await repository.save({
+      ...data,
+      candidates: candidateNames.map((name, index) =>
+        buildRouteCandidate({
+          id: `candidate-${index}`,
+          name,
+          jobId: jobs[0].id,
+          position: jobs[0].title,
+          matchScore: 90 - index,
+          summary: `${name} Java后端候选人`
+        })
+      )
+    });
     const detail = await fetch(`${baseUrl}/api/jobs/${jobs[0].id}`).then((res) => res.json());
     const excel = await fetch(`${baseUrl}/api/jobs/${jobs[0].id}/export.xlsx`);
+    const workbook = new ExcelJS.Workbook();
+    const excelBuffer = Buffer.from(await excel.arrayBuffer()) as unknown as Parameters<typeof workbook.xlsx.load>[0];
+    await workbook.xlsx.load(excelBuffer);
+    const candidateDetail = workbook.getWorksheet("候选人明细");
 
     expect(jobs[0].title).toContain("Java");
-    expect(detail.progress.effectiveCandidates).toBe(1);
+    expect(detail.progress.effectiveCandidates).toBe(6);
+    expect(detail.progress.candidates).toHaveLength(6);
     expect(excel.ok).toBe(true);
     expect(excel.headers.get("content-type")).toContain("spreadsheet");
+    expect(candidateDetail?.getColumn(1).values).toEqual(expect.arrayContaining(candidateNames));
   });
 
   it("可以清空演示数据", async () => {

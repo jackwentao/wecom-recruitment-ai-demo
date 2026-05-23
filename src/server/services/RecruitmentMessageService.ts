@@ -115,11 +115,10 @@ export class RecruitmentMessageService {
         sender: message.sender,
         groupName: message.groupName
       });
-      const contextualExtraction = await this.applyExistingCandidateContext(
-        message,
-        this.normalizeExtraction(extraction),
-        resumeTargetJobTitle
-      );
+      const normalizedAiExtraction = this.normalizeExtraction(extraction);
+      const candidateResolution = await this.resolveCandidateForMutation(message, normalizedAiExtraction, resumeTargetJobTitle);
+      if (!candidateResolution.ok) return candidateResolution.result;
+      const contextualExtraction = candidateResolution.extraction;
       const jobResolution = await this.resolveCandidateJob(message, contextualExtraction, resumeTargetJobTitle);
       if (!jobResolution.ok) return jobResolution.result;
       const job = jobResolution.job;
@@ -196,6 +195,74 @@ export class RecruitmentMessageService {
       sourceGroup: extraction.sourceGroup ?? existing.sourceGroup,
       summary: this.mergeCandidateSummary(existing.summary, extraction.summary),
       risks: Array.from(new Set([...existing.risks, ...extraction.risks]))
+    };
+  }
+
+  private async resolveCandidateForMutation(
+    message: RawRecruitmentMessage,
+    extraction: ExtractedRecruitmentInfo,
+    resumeTargetJobTitle?: string
+  ): Promise<{ ok: true; extraction: ExtractedRecruitmentInfo } | { ok: false; result: ProcessResult }> {
+    const normalizedName = this.normalizeCandidateNameForMatch(extraction.candidateName);
+    if (!normalizedName || this.isUnconfirmedCandidateName(extraction.candidateName)) {
+      const pendingTask = await this.createCandidateConfirmationTask(
+        message,
+        `没有识别到明确候选人姓名，这条消息暂不能直接入库。`,
+        extraction,
+        []
+      );
+      await this.repository.updateMessage({ ...message, status: "needs_review", pendingTaskId: pendingTask.id, extraction });
+      return { ok: false, result: this.buildCandidateConfirmationResult(message, pendingTask) };
+    }
+
+    if (message.kind === "resume_pdf" || resumeTargetJobTitle) return { ok: true, extraction };
+
+    const matches = await this.repository.findCandidatesByName(extraction.candidateName);
+    const exactMatches = matches.filter(
+      (candidate) => this.normalizeCandidateNameForMatch(candidate.name) === normalizedName
+    );
+    const updateOnly = this.isUpdateOnlyCandidateMutation(message, extraction);
+
+    if (updateOnly) {
+      if (exactMatches.length === 1) {
+        return { ok: true, extraction: await this.bindExtractionToExistingCandidate(extraction, exactMatches[0]) };
+      }
+      const confirmedMatches = exactMatches.filter(
+        (candidate) => candidate.jobId && !this.isUnconfirmedPosition(candidate.position)
+      );
+      if (confirmedMatches.length === 1) {
+        return { ok: true, extraction: await this.bindExtractionToExistingCandidate(extraction, confirmedMatches[0]) };
+      }
+      const candidatesForPrompt = exactMatches.length ? exactMatches : matches;
+      const prompt = candidatesForPrompt.length
+        ? `找到多个${extraction.candidateName}，请确认要更新哪一位。`
+        : `没有找到候选人${extraction.candidateName}，这条消息像是面试反馈或跟进更新，不能直接新建候选人。`;
+      const pendingTask = await this.createCandidateConfirmationTask(message, prompt, extraction, candidatesForPrompt);
+      await this.repository.updateMessage({ ...message, status: "needs_review", pendingTaskId: pendingTask.id, extraction });
+      return { ok: false, result: this.buildCandidateConfirmationResult(message, pendingTask) };
+    }
+
+    const contextualExtraction = await this.applyExistingCandidateContext(message, extraction, resumeTargetJobTitle);
+    return { ok: true, extraction: contextualExtraction };
+  }
+
+  private async bindExtractionToExistingCandidate(
+    extraction: ExtractedRecruitmentInfo,
+    candidate: Candidate
+  ): Promise<ExtractedRecruitmentInfo> {
+    const existingJob = candidate.jobId
+      ? await this.repository.getJob(candidate.jobId)
+      : await this.findKnownJobByTitle(candidate.position);
+    return {
+      ...extraction,
+      candidateName: candidate.name,
+      jobId: existingJob?.id ?? candidate.jobId,
+      position: existingJob?.title ?? candidate.position,
+      phone: extraction.phone ?? candidate.phone,
+      owner: extraction.owner ?? candidate.owner,
+      sourceGroup: extraction.sourceGroup ?? candidate.sourceGroup,
+      summary: this.mergeCandidateSummary(candidate.summary, extraction.summary),
+      risks: Array.from(new Set([...candidate.risks, ...extraction.risks]))
     };
   }
 
@@ -368,6 +435,9 @@ export class RecruitmentMessageService {
     const id = content.match(/T\d{8}[A-Z0-9]{4}/)?.[0];
     if (!id) return this.handleUnknown(message);
     const pendingTask = await this.repository.getPendingTask(id);
+    if (pendingTask?.context.action === "confirm_candidate_for_mutation") {
+      return this.resolveCandidateMutationConfirmation(message, pendingTask, content);
+    }
     if (pendingTask?.context.action === "confirm_job_for_candidate") {
       return this.resolveJobConfirmation(message, pendingTask, content);
     }
@@ -610,10 +680,84 @@ export class RecruitmentMessageService {
     };
   }
 
+  private async resolveCandidateMutationConfirmation(
+    message: RawRecruitmentMessage,
+    pendingTask: PendingTask,
+    content: string
+  ): Promise<ProcessResult> {
+    const candidate = await this.extractConfirmedCandidate(content, pendingTask);
+    if (!candidate) {
+      await this.repository.updateMessage({ ...message, status: "needs_review", pendingTaskId: pendingTask.id });
+      return {
+        message: { ...message, status: "needs_review", pendingTaskId: pendingTask.id },
+        pendingTask,
+        replyText: `没有识别到可更新的已有候选人。${this.buildCandidateConfirmationResult(message, pendingTask).replyText}`
+      };
+    }
+    const extraction = pendingTask.context.extraction as ExtractedRecruitmentInfo | undefined;
+    if (!extraction) {
+      await this.repository.updateMessage({ ...message, status: "needs_review", pendingTaskId: pendingTask.id });
+      return {
+        message: { ...message, status: "needs_review", pendingTaskId: pendingTask.id },
+        pendingTask,
+        replyText: `任务 ${pendingTask.id} 缺少原始抽取信息，请重新发送更新消息。`
+      };
+    }
+    const normalizedExtraction = await this.bindExtractionToExistingCandidate(extraction, candidate);
+    const { candidate: updatedCandidate, task } = await this.repository.upsertCandidate(message, normalizedExtraction);
+    const resolvedTask = await this.repository.resolvePendingTask(pendingTask.id);
+    const replyText = this.buildSuccessReply(
+      updatedCandidate.name,
+      updatedCandidate.position,
+      updatedCandidate.owner,
+      updatedCandidate.nextAction,
+      false
+    );
+    return {
+      message: { ...message, status: "parsed", parsedCandidateId: updatedCandidate.id, extraction: normalizedExtraction },
+      pendingTask: resolvedTask ?? { ...pendingTask, status: "resolved", resolvedAt: new Date().toISOString() },
+      candidate: updatedCandidate,
+      task,
+      webUrl: `${this.appBaseUrl}/candidates/${updatedCandidate.id}`,
+      replyText: `已确认候选人并更新。${replyText}。详情：${this.appBaseUrl}/candidates/${updatedCandidate.id}`
+    };
+  }
+
   private async extractConfirmedJob(content: string, taskId: string): Promise<JobRequirement | undefined> {
     const remainder = content.replace(taskId, "").replace(/^(岗位ID|岗位|jobId|job)[:：\s]*/i, "").trim();
     const jobs = await this.repository.listJobs();
     return jobs.find((job) => remainder.includes(job.id) || job.id.includes(remainder));
+  }
+
+  private async extractConfirmedCandidate(
+    content: string,
+    pendingTask: PendingTask
+  ): Promise<Candidate | undefined> {
+    const selectedIndex = this.extractSelectedIndex(content);
+    const candidateIds = pendingTask.context.candidateIds as string[] | undefined;
+    if (selectedIndex !== undefined && candidateIds?.[selectedIndex]) {
+      return this.repository.getCandidate(candidateIds[selectedIndex]);
+    }
+
+    const remainder = content
+      .replace(pendingTask.id, "")
+      .replace(/^(候选人ID|候选人|candidateId|candidate|姓名|名字)[:：\s]*/i, "")
+      .trim();
+    if (!remainder) return undefined;
+
+    const listedCandidate = candidateIds
+      ? (await Promise.all(candidateIds.map((id) => this.repository.getCandidate(id))))
+          .filter((candidate): candidate is Candidate => Boolean(candidate))
+          .find((candidate) => remainder.includes(candidate.id) || candidate.id.includes(remainder))
+      : undefined;
+    if (listedCandidate) return listedCandidate;
+
+    const candidates = await this.repository.findCandidatesByName(remainder);
+    const normalizedName = this.normalizeCandidateNameForMatch(remainder);
+    const exactMatches = candidates.filter(
+      (candidate) => this.normalizeCandidateNameForMatch(candidate.name) === normalizedName
+    );
+    return exactMatches.length === 1 ? exactMatches[0] : undefined;
   }
 
   private async invalidJobConfirmation(
@@ -667,10 +811,78 @@ export class RecruitmentMessageService {
     });
   }
 
+  private createCandidateConfirmationTask(
+    message: RawRecruitmentMessage,
+    prompt: string,
+    extraction: ExtractedRecruitmentInfo,
+    candidates: Candidate[]
+  ): Promise<PendingTask> {
+    return this.createPendingTask(
+      message,
+      (message.taskType ?? "interview_feedback") as TaskType,
+      prompt,
+      candidates.map((candidate) => `${candidate.name}/${candidate.position}/${candidate.stage}${candidate.owner ? `/${candidate.owner}` : ""}`),
+      {
+        action: "confirm_candidate_for_mutation",
+        extraction,
+        candidateName: extraction.candidateName,
+        candidateIds: candidates.map((candidate) => candidate.id)
+      }
+    );
+  }
+
+  private buildCandidateConfirmationResult(message: RawRecruitmentMessage, pendingTask: PendingTask): ProcessResult {
+    const candidateOptions = pendingTask.options?.length
+      ? ` ${pendingTask.options.map((option, index) => `${index + 1}.${option}`).join(" ")} 请回复“${pendingTask.id} 选1”或“${pendingTask.id} 候选人ID”。`
+      : ` 请回复“${pendingTask.id} 候选人ID/候选人姓名”确认要更新的已有候选人；如果这是新候选人，请先发送简历或明确发送新增候选人。`;
+    return {
+      message: { ...message, status: "needs_review", pendingTaskId: pendingTask.id },
+      pendingTask,
+      replyText: `${pendingTask.prompt} 任务 ${pendingTask.id}：${candidateOptions}`
+    };
+  }
+
   private detectKind(content: string, fileName?: string): RecruitmentMessageKind {
     if (fileName?.toLowerCase().endsWith(".pdf")) return "resume_pdf";
     if (/反馈|评价|面评|面试官|通过|不通过|二面|三面/.test(content)) return "interview_feedback";
     return "text";
+  }
+
+  private isUpdateOnlyCandidateMutation(message: RawRecruitmentMessage, extraction: ExtractedRecruitmentInfo): boolean {
+    if (message.kind === "resume_pdf") return false;
+    if (this.isFirstInterviewEntry(message, extraction)) return false;
+
+    const text = this.candidateMutationText(message, extraction);
+    if (message.taskType === "interview_feedback" || message.taskType === "followup_reminder") return true;
+    if (["interviewing", "offer", "rejected", "withdrawn"].includes(extraction.stage)) return true;
+    if (/(二面|三面|四面|终面|复试|面评|反馈|通过|不通过|淘汰|offer|录用|放弃|拒绝)/i.test(text)) return true;
+    if (/(改到|改为|调整|更新|变更|改由|换成).{0,12}(时间|日程|负责人|跟进人|面试官)|(?:时间|日程|负责人|跟进人|面试官).{0,12}(改到|改为|调整|更新|变更|改由|换成)/u.test(text)) {
+      return true;
+    }
+    return false;
+  }
+
+  private isFirstInterviewEntry(message: RawRecruitmentMessage, extraction: ExtractedRecruitmentInfo): boolean {
+    const text = [message.content, extraction.stage].filter(Boolean).join("；");
+    const mentionsFirstRound = /(初面|一面)/.test(text) && !/(一面.{0,8}(反馈|通过|不通过|结果|面评)|反馈.{0,8}一面)/.test(text);
+    const hasScheduleAction = /(安排|约|预约|定|邀约|进入|推进|面试|时间|日程|今天|明天|后天|上午|下午|晚上|\d{1,2}月\d{1,2}日|\d{1,2}[点:：])/.test(text);
+    return mentionsFirstRound && hasScheduleAction;
+  }
+
+  private isUnconfirmedCandidateName(name: string | undefined): boolean {
+    const normalized = this.normalizeCandidateNameForMatch(name ?? "");
+    return !normalized || /^(待确认候选人|待确认|候选人|未知|无|暂无)$/u.test(normalized);
+  }
+
+  private normalizeCandidateNameForMatch(name: string): string {
+    return name
+      .trim()
+      .replace(/(?:一面|二面|三面|四面|终面|初面|复试|面试|面评|反馈|通过|不通过|淘汰|候选人|简历).*$/u, "")
+      .replace(/[^\u4e00-\u9fa5A-Za-z]/g, "");
+  }
+
+  private candidateMutationText(message: RawRecruitmentMessage, extraction: ExtractedRecruitmentInfo): string {
+    return [message.content, extraction.nextAction, extraction.stage].filter(Boolean).join("；");
   }
 
   private async buildAiInput(message: RawRecruitmentMessage): Promise<string> {

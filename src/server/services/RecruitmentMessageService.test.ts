@@ -12,10 +12,276 @@ let tempDir = "";
 afterEach(async () => {
   if (tempDir) {
     await rm(tempDir, { recursive: true, force: true });
+    tempDir = "";
   }
 });
 
+function mockAi(
+  extract: RecruitmentAi["extract"],
+  classifyTask: RecruitmentAi["classifyTask"] = () =>
+    Promise.resolve({ type: "interview_feedback", confidence: 0.9, candidateName: "张三" })
+): RecruitmentAi {
+  const baseAi = new RuleBasedFallbackExtractor();
+  return {
+    ...baseAi,
+    extract,
+    classifyTask,
+    parseJobRequirement: (content) => baseAi.parseJobRequirement(content),
+    evaluateResume: (input) => baseAi.evaluateResume(input),
+    generateJd: (inputJob) => baseAi.generateJd(inputJob),
+    summarizeJobProgress: (progress) => baseAi.summarizeJobProgress(progress)
+  };
+}
+
 describe("RecruitmentMessageService", () => {
+  it("二面反馈没有历史候选人时不会新建候选人，会生成候选人确认任务", async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), "recruitment-demo-"));
+    const repository = new CandidateRepository(path.join(tempDir, "data.json"));
+    await repository.upsertJobRequirement({ title: "Java后端" });
+    const service = new RecruitmentMessageService(
+      repository,
+      mockAi(async () => ({
+        candidateName: "张三",
+        position: "Java后端",
+        stage: "interviewing",
+        owner: "王工",
+        summary: "张三表现不错，可以安排二面。",
+        risks: [],
+        nextAction: "安排二面",
+        confidence: 0.9
+      }))
+    );
+
+    const result = await service.process({
+      source: "local_simulator",
+      content: "@招聘助手 张三表现不错，可以二面，王工跟进"
+    });
+    const candidates = await repository.listCandidates({});
+    const pendingTasks = await repository.listPendingTasks();
+
+    expect(result.message.status).toBe("needs_review");
+    expect(result.pendingTask?.context.action).toBe("confirm_candidate_for_mutation");
+    expect(result.replyText).toContain("没有找到候选人张三");
+    expect(candidates).toHaveLength(0);
+    expect(pendingTasks).toHaveLength(1);
+  });
+
+  it("明确进入一面时允许新建候选人", async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), "recruitment-demo-"));
+    const repository = new CandidateRepository(path.join(tempDir, "data.json"));
+    const job = await repository.upsertJobRequirement({ title: "Java后端" });
+    const service = new RecruitmentMessageService(
+      repository,
+      mockAi(
+        async () => ({
+          candidateName: "张三",
+          phone: "13800138000",
+          position: "Java后端",
+          stage: "interview_scheduled",
+          owner: "王工",
+          interviewTime: "2026-05-23T15:00:00+08:00",
+          summary: "张三 Java后端候选人，5月23日下午3点一面。",
+          risks: [],
+          nextAction: "等待一面反馈",
+          confidence: 0.9
+        }),
+        () => Promise.resolve({ type: "schedule_update", confidence: 0.9, candidateName: "张三", jobTitle: "Java后端" })
+      )
+    );
+
+    const result = await service.process({
+      source: "local_simulator",
+      content: "@招聘助手 张三 Java后端候选人，5月23日下午3点一面，王工跟进，手机号13800138000"
+    });
+
+    expect(result.message.status).toBe("parsed");
+    expect(result.candidate?.jobId).toBe(job.id);
+    expect(result.candidate?.stage).toBe("interview_scheduled");
+    expect(result.replyText).toContain("已记录候选人张三");
+  });
+
+  it("二面反馈命中多个同名候选人时不会自动更新，会要求选择候选人", async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), "recruitment-demo-"));
+    const repository = new CandidateRepository(path.join(tempDir, "data.json"));
+    const javaJob = await repository.upsertJobRequirement({ title: "Java后端" });
+    const goJob = await repository.upsertJobRequirement({ title: "Go后端" });
+    const now = new Date().toISOString();
+    await repository.save({
+      messages: [],
+      tasks: [],
+      pendingTasks: [],
+      jobs: [goJob, javaJob],
+      candidates: [
+        {
+          id: "candidate-java",
+          name: "张三",
+          jobId: javaJob.id,
+          position: "Java后端",
+          stage: "interview_scheduled",
+          owner: "王工",
+          summary: "张三 Java后端候选人，已安排一面。",
+          risks: [],
+          nextAction: "等待一面反馈",
+          confidence: 0.9,
+          createdAt: now,
+          updatedAt: now,
+          timeline: []
+        },
+        {
+          id: "candidate-go",
+          name: "张三",
+          jobId: goJob.id,
+          position: "Go后端",
+          stage: "interview_scheduled",
+          owner: "赵工",
+          summary: "张三 Go后端候选人，已安排一面。",
+          risks: [],
+          nextAction: "等待一面反馈",
+          confidence: 0.9,
+          createdAt: now,
+          updatedAt: now,
+          timeline: []
+        }
+      ]
+    });
+    const service = new RecruitmentMessageService(
+      repository,
+      mockAi(async () => ({
+        candidateName: "张三",
+        position: "待确认岗位",
+        stage: "interviewing",
+        owner: "李工",
+        summary: "张三一面反馈不错，安排二面。",
+        risks: [],
+        nextAction: "安排二面",
+        confidence: 0.9
+      }))
+    );
+
+    const result = await service.process({
+      source: "local_simulator",
+      content: "@招聘助手 张三一面反馈不错，安排二面，李工跟进"
+    });
+    const candidates = await repository.listCandidates({});
+
+    expect(result.message.status).toBe("needs_review");
+    expect(result.pendingTask?.context.action).toBe("confirm_candidate_for_mutation");
+    expect(result.replyText).toContain("找到多个张三");
+    expect(candidates).toHaveLength(2);
+    expect(candidates.every((candidate) => candidate.stage === "interview_scheduled")).toBe(true);
+  });
+
+  it("回复候选人确认任务后只更新指定候选人，不新建候选人", async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), "recruitment-demo-"));
+    const repository = new CandidateRepository(path.join(tempDir, "data.json"));
+    const javaJob = await repository.upsertJobRequirement({ title: "Java后端" });
+    const goJob = await repository.upsertJobRequirement({ title: "Go后端" });
+    const now = new Date().toISOString();
+    await repository.save({
+      messages: [],
+      tasks: [],
+      pendingTasks: [],
+      jobs: [goJob, javaJob],
+      candidates: [
+        {
+          id: "candidate-java",
+          name: "张三",
+          jobId: javaJob.id,
+          position: "Java后端",
+          stage: "interview_scheduled",
+          owner: "王工",
+          summary: "张三 Java后端候选人，已安排一面。",
+          risks: [],
+          nextAction: "等待一面反馈",
+          confidence: 0.9,
+          createdAt: now,
+          updatedAt: now,
+          timeline: []
+        },
+        {
+          id: "candidate-go",
+          name: "张三",
+          jobId: goJob.id,
+          position: "Go后端",
+          stage: "interview_scheduled",
+          owner: "赵工",
+          summary: "张三 Go后端候选人，已安排一面。",
+          risks: [],
+          nextAction: "等待一面反馈",
+          confidence: 0.9,
+          createdAt: now,
+          updatedAt: now,
+          timeline: []
+        }
+      ]
+    });
+    const service = new RecruitmentMessageService(
+      repository,
+      mockAi(async () => ({
+        candidateName: "张三",
+        position: "待确认岗位",
+        stage: "interviewing",
+        owner: "李工",
+        summary: "张三一面反馈不错，安排二面。",
+        risks: [],
+        nextAction: "安排二面",
+        confidence: 0.9
+      }))
+    );
+
+    const pending = await service.process({
+      source: "local_simulator",
+      content: "@招聘助手 张三一面反馈不错，安排二面，李工跟进"
+    });
+    const resolved = await service.process({
+      source: "local_simulator",
+      content: `${pending.pendingTask?.id} 选2`
+    });
+    const candidates = await repository.listCandidates({});
+    const tasks = await repository.listPendingTasks();
+    const goCandidate = candidates.find((candidate) => candidate.jobId === goJob.id);
+    const javaCandidate = candidates.find((candidate) => candidate.jobId === javaJob.id);
+
+    expect(resolved.message.status).toBe("parsed");
+    expect(candidates).toHaveLength(2);
+    expect(goCandidate?.stage).toBe("interviewing");
+    expect(goCandidate?.owner).toBe("李工");
+    expect(javaCandidate?.stage).toBe("interview_scheduled");
+    expect(tasks[0].status).toBe("resolved");
+  });
+
+  it("待确认候选人不会直接入库", async () => {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), "recruitment-demo-"));
+    const repository = new CandidateRepository(path.join(tempDir, "data.json"));
+    await repository.upsertJobRequirement({ title: "Java后端" });
+    const service = new RecruitmentMessageService(
+      repository,
+      mockAi(
+        async () => ({
+          candidateName: "待确认候选人",
+          position: "Java后端",
+          stage: "screening",
+          owner: "王工",
+          summary: "Java后端候选人不错。",
+          risks: [],
+          nextAction: "确认候选人姓名",
+          confidence: 0.55
+        }),
+        () => Promise.resolve({ type: "resume_parse_match", confidence: 0.8, jobTitle: "Java后端" })
+      )
+    );
+
+    const result = await service.process({
+      source: "local_simulator",
+      content: "@招聘助手 Java后端候选人不错，王工跟进"
+    });
+    const candidates = await repository.listCandidates({});
+
+    expect(result.message.status).toBe("needs_review");
+    expect(result.pendingTask?.context.action).toBe("confirm_candidate_for_mutation");
+    expect(candidates).toHaveLength(0);
+  });
+
   it("同一候选人的多条消息会合并到同一候选人时间线", async () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), "recruitment-demo-"));
     const repository = new CandidateRepository(path.join(tempDir, "data.json"));

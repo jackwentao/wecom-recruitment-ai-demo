@@ -194,6 +194,7 @@ export interface JobProgress {
   offerCandidates: number;
   gap?: number;
   stageCounts: Record<RecruitmentStage, number>;
+  candidates: Candidate[];
   keyCandidates: CandidateScore[];
   riskCandidates: CandidateRisk[];
   summary: string;
